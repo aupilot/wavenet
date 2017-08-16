@@ -1,3 +1,6 @@
 *.wav
 .idea
 *.pyc
+models
+vctk/VCTK-Corpus
+logs

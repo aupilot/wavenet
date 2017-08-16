@@ -1,0 +1,1 @@
+scipy.io.savemat('tmp.mat',mdict={'wav': full_sequences})
