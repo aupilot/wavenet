@@ -10,21 +10,23 @@ import keras.backend as K
 import numpy as np
 import scipy.io.wavfile
 import scipy.signal
-import theano
-from keras import layers
+# import theano
+import tensorflow as tf
+from keras import layers, regularizers
 from keras import metrics
 from keras import objectives
-from keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau, CSVLogger
+from keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau, CSVLogger, TensorBoard, TerminateOnNaN
 from keras.engine import Input
 from keras.engine import Model
-from keras.optimizers import Adam, SGD
+from keras.optimizers import Adam, SGD, Nadam
 from keras.regularizers import l2
+from keras.utils import plot_model
 from sacred import Experiment
 from sacred.commands import print_config
 from tqdm import tqdm
 
 import dataset
-from wavenet_utils import CausalAtrousConvolution1D, categorical_mean_squared_error
+from wavenet_utils import categorical_mean_squared_error
 
 ex = Experiment('wavenet')
 
@@ -41,12 +43,12 @@ def config():
     batch_size = 16
     nb_output_bins = 256
     nb_filters = 256
-    dilation_depth = 9  #
+    dilation_depth = 9
     nb_stacks = 1
-    use_bias = False
+    use_bias = True
     use_ulaw = True
-    res_l2 = 0
-    final_l2 = 0
+    res_l2 = 0.000
+    final_l2 = 0.000
     fragment_length = 128 + compute_receptive_field_(desired_sample_rate, dilation_depth, nb_stacks)[0]
     fragment_stride = 128
     use_skip_connections = True
@@ -56,12 +58,13 @@ def config():
         'momentum': 0.9,
         'decay': 0.,
         'nesterov': True,
-        'epsilon': None
+        'epsilon': 1e-8
     }
+
     learn_all_outputs = True
     random_train_batches = False
     randomize_batch_order = True  # Only effective if not using random train batches
-    train_with_soft_target_stdev = None  # float to make targets a gaussian with stdev.
+    train_with_soft_target_stdev = 0.5  # float to make targets a gaussian with stdev. # None
 
     # The temporal-first outputs are computed from zero-padding. Setting below to True ignores these inputs:
     train_only_in_receptive_field = True
@@ -84,7 +87,7 @@ def book():
 
 @ex.named_config
 def small():
-    desired_sample_rate = 4410
+    desired_sample_rate = 4800 #4410
     nb_filters = 16
     dilation_depth = 8
     nb_stacks = 1
@@ -101,7 +104,7 @@ def soft_targets():
 @ex.named_config
 def vctkdata():
     assert os.path.isdir(os.path.join('vctk', 'VCTK-Corpus')), "Please download vctk by running vctk/download_vctk.sh."
-    desired_sample_rate = 4000
+    desired_sample_rate = 4000 #4000
     data_dir = 'vctk/VCTK-Corpus/wav48'
     data_dir_structure = 'vctk'
     test_factor = 0.01
@@ -115,7 +118,6 @@ def vctkmod(desired_sample_rate):
     fragment_length = 1 + (compute_receptive_field_(desired_sample_rate, dilation_depth, nb_stacks)[0])
     fragment_stride = int(desired_sample_rate / 10)
     random_train_batches = True
-
 
 @ex.named_config
 def length32(desired_sample_rate, dilation_depth, nb_stacks):
@@ -131,7 +133,6 @@ def adam():
         'epsilon': 1e-8
     }
 
-
 @ex.named_config
 def adam2():
     optimizer = {
@@ -139,6 +140,14 @@ def adam2():
         'lr': 0.01,
         'decay': 0.,
         'epsilon': 1e-10
+    }
+
+@ex.named_config
+def nadam():
+        optimizer = {
+        'optimizer': 'nadam',
+        'lr': 0.0005,
+        'epsilon': 1e-8
     }
 
 
@@ -170,9 +179,14 @@ def skip_out_of_receptive_field(func):
     return wrapper
 
 
+# def print_t(tensor, label):
+#     tensor.name = label
+#     tensor = teano.printing.Print(tensor.name, attrs=('__str__', 'shape'))(tensor)
+#     return tensor
+
+# kir
 def print_t(tensor, label):
-    tensor.name = label
-    tensor = theano.printing.Print(tensor.name, attrs=('__str__', 'shape'))(tensor)
+    K.print_tensor(tensor, label)
     return tensor
 
 
@@ -184,7 +198,12 @@ def make_soft(y_true, fragment_length, nb_output_bins, train_with_soft_target_st
     # Make a gaussian kernel.
     kernel_v = scipy.signal.gaussian(9, std=train_with_soft_target_stdev)
     print(kernel_v)
-    kernel_v = np.reshape(kernel_v, [1, 1, -1, 1])
+
+    if K.backend() == 'theano':
+        kernel_v = np.reshape(kernel_v, [1, 1, -1, 1])
+    else:
+        kernel_v = np.reshape(kernel_v, [1, -1, 1, 1])  # tf order
+
     kernel = K.variable(kernel_v)
 
     if with_prints:
@@ -193,8 +212,13 @@ def make_soft(y_true, fragment_length, nb_output_bins, train_with_soft_target_st
     # y_true: [batch, timesteps, input_dim]
     y_true = K.reshape(y_true, (-1, 1, nb_output_bins, 1))  # Same filter for all output; combine with batch.
     # y_true: [batch*timesteps, n_channels=1, input_dim, dummy]
-    y_true = K.conv2d(y_true, kernel, border_mode='same')
+
+    if K.backend() != 'theano':
+        y_true = tf.cast(y_true, 'float32')
+        y_true = K.conv2d(tf.transpose(y_true, (0, 2, 3, 1)), kernel, padding='same')
+
     y_true = K.reshape(y_true, (-1, n_outputs, nb_output_bins))  # Same filter for all output; combine with batch.
+
     # y_true: [batch, timesteps, input_dim]
     y_true /= K.sum(y_true, axis=-1, keepdims=True)
 
@@ -219,44 +243,56 @@ def make_targets_soft(func):
 @ex.capture()
 def build_model(fragment_length, nb_filters, nb_output_bins, dilation_depth, nb_stacks, use_skip_connections,
                 learn_all_outputs, _log, desired_sample_rate, use_bias, res_l2, final_l2):
+
     def residual_block(x):
         original_x = x
-        # TODO: initalization, regularization?
-        # Note: The AtrousConvolution1D with the 'causal' flag is implemented in github.com/basveeling/keras#@wavenet.
-        tanh_out = CausalAtrousConvolution1D(nb_filters, 2, atrous_rate=2 ** i, border_mode='valid', causal=True,
-                                             bias=use_bias,
-                                             name='dilated_conv_%d_tanh_s%d' % (2 ** i, s), activation='tanh',
-                                             W_regularizer=l2(res_l2))(x)
-        sigm_out = CausalAtrousConvolution1D(nb_filters, 2, atrous_rate=2 ** i, border_mode='valid', causal=True,
-                                             bias=use_bias,
-                                             name='dilated_conv_%d_sigm_s%d' % (2 ** i, s), activation='sigmoid',
-                                             W_regularizer=l2(res_l2))(x)
-        x = layers.Merge(mode='mul', name='gated_activation_%d_s%d' % (i, s))([tanh_out, sigm_out])
 
-        res_x = layers.Convolution1D(nb_filters, 1, border_mode='same', bias=use_bias,
-                                     W_regularizer=l2(res_l2))(x)
-        skip_x = layers.Convolution1D(nb_filters, 1, border_mode='same', bias=use_bias,
-                                      W_regularizer=l2(res_l2))(x)
-        res_x = layers.Merge(mode='sum')([original_x, res_x])
+        tanh_out = layers.Conv1D(nb_filters, kernel_size=2,
+                                 padding='causal',
+                                 use_bias=use_bias,
+                                 # activation='linear', <-- does not work!
+                                 # activation='selu',
+                                 activation='tanh',
+                                 dilation_rate=2 ** i,
+                                 activity_regularizer = l2(res_l2),
+                                 name='dilated_conv_%d_tanh_s%d' % (2 ** i, s))(x)
+
+        sigm_out = layers.Conv1D(nb_filters, kernel_size=2,
+                                 padding='causal',
+                                 use_bias=use_bias,
+                                 activation='sigmoid',
+                                 dilation_rate=2 ** i,
+                                 activity_regularizer=l2(res_l2),
+                                 name='dilated_conv_%d_sigm_s%d' % (2 ** i, s))(x)
+
+        x = layers.Multiply(name='gated_activation_%d_s%d' % (i, s))([tanh_out, sigm_out])
+
+        res_x  = layers.Conv1D(nb_filters, 1, padding='same', use_bias=use_bias, activity_regularizer=l2(res_l2))(x)
+        skip_x = layers.Conv1D(nb_filters, 1, padding='same', use_bias=use_bias, activity_regularizer=l2(res_l2))(x)
+
+        res_x = layers.Add()([original_x, res_x])
+
         return res_x, skip_x
 
     input = Input(shape=(fragment_length, nb_output_bins), name='input_part')
+
     out = input
     skip_connections = []
-    out = CausalAtrousConvolution1D(nb_filters, 2, atrous_rate=1, border_mode='valid', causal=True,
-                                    name='initial_causal_conv')(out)
+
+    out = layers.Conv1D(nb_filters, kernel_size=2, padding='causal', dilation_rate=1, name='initial_causal_conv')(out)
+
     for s in range(nb_stacks):
         for i in range(0, dilation_depth + 1):
             out, skip_out = residual_block(out)
             skip_connections.append(skip_out)
 
     if use_skip_connections:
-        out = layers.Merge(mode='sum')(skip_connections)
-    out = layers.Activation('relu')(out)
-    out = layers.Convolution1D(nb_output_bins, 1, border_mode='same',
-                               W_regularizer=l2(final_l2))(out)
-    out = layers.Activation('relu')(out)
-    out = layers.Convolution1D(nb_output_bins, 1, border_mode='same')(out)
+        out = layers.Add()(skip_connections)
+
+    out = layers.Activation('selu')(out)
+    out = layers.Conv1D(nb_output_bins, 1, padding='same', activity_regularizer=l2(final_l2))(out)
+    out = layers.Activation('selu')(out)
+    out = layers.Conv1D(nb_output_bins, 1, padding='same')(out)
 
     if not learn_all_outputs:
         raise DeprecationWarning('Learning on just all outputs is wasteful, now learning only inside receptive field.')
@@ -289,6 +325,8 @@ def make_optimizer(optimizer, lr, momentum, decay, nesterov, epsilon):
         optim = SGD(lr, momentum, decay, nesterov)
     elif optimizer == 'adam':
         optim = Adam(lr=lr, decay=decay, epsilon=epsilon)
+    elif optimizer == 'nadam':
+        optim = Nadam(lr=lr, epsilon=epsilon)
     else:
         raise ValueError('Invalid config for optimizer.optimizer: ' + optimizer)
     return optim
@@ -336,7 +374,7 @@ def predict(desired_sample_rate, fragment_length, _log, seed, _seed, _config, pr
 
     # write_samples(sample_stream, outputs)
     warned_repetition = False
-    for i in tqdm(xrange(int(desired_sample_rate * predict_seconds))):
+    for i in tqdm(range(int(desired_sample_rate * predict_seconds))):
         if not warned_repetition:
             if np.argmax(outputs[-1]) == np.argmax(outputs[-2]) and np.argmax(outputs[-2]) == np.argmax(outputs[-3]):
                 warned_repetition = True
@@ -461,10 +499,35 @@ def draw_sample(output_dist, sample_temperature, sample_argmax, _rnd):
     return output_dist
 
 
+
 @ex.automain
 def main(run_dir, data_dir, nb_epoch, early_stopping_patience, desired_sample_rate, fragment_length, batch_size,
          fragment_stride, nb_output_bins, keras_verbose, _log, seed, _config, debug, learn_all_outputs,
          train_only_in_receptive_field, _run, use_ulaw, train_with_soft_target_stdev):
+
+    # class TensorBoardWrapper(TensorBoard):
+    #     '''Sets the self.validation_data property for use with TensorBoard callback.'''
+    #
+    #     def __init__(self, batch_gen, nb_steps, **kwargs):
+    #         super().__init__(**kwargs)
+    #         self.batch_gen = batch_gen  # The generator.
+    #         self.nb_steps = nb_steps  # Number of times to call next() on the generator.
+    #
+    #     def on_epoch_end(self, epoch, logs):
+    #         # Fill in the `validation_data` property. Obviously this is specific to how your generator works.
+    #         # Below is an example that yields images and classification tags.
+    #         # After it's filled in, the regular on_epoch_end method has access to the validation_data.
+    #         imgs, tags = None, None
+    #         for s in range(self.nb_steps):
+    #             ib, tb = next(self.batch_gen)
+    #             if imgs is None and tags is None:
+    #                 imgs = np.zeros((self.nb_steps * ib.shape[0], *ib.shape[1:]), dtype=np.float32)
+    #                 tags = np.zeros((self.nb_steps * tb.shape[0], *tb.shape[1:]), dtype=np.uint8)
+    #             imgs[s * ib.shape[0]:(s + 1) * ib.shape[0]] = ib
+    #             tags[s * tb.shape[0]:(s + 1) * tb.shape[0]] = tb
+    #         self.validation_data = [imgs, tags, np.ones(imgs.shape[0]), 0.0]
+    #         return super().on_epoch_end(epoch, logs)
+
     if run_dir is None:
         if not os.path.exists("models"):
             os.mkdir("models")
@@ -485,11 +548,21 @@ def main(run_dir, data_dir, nb_epoch, early_stopping_patience, desired_sample_ra
     _log.info('Loading data...')
     data_generators, nb_examples = get_generators()
 
+
+    # test generator
+    # aaa, bbb = next(data_generators['train'])
+
+    # test razmazyvatel'
+    # y = make_soft(bbb, _config['fragment_length'], _config['nb_output_bins'], _config['train_with_soft_target_stdev'], with_prints=True)
+
+
     _log.info('Building model...')
     model = build_model(fragment_length)
     _log.info(model.summary())
 
     optim = make_optimizer()
+    # optim = Nadam(lr=0.001)
+
     _log.info('Compiling Model...')
 
     loss = objectives.categorical_crossentropy
@@ -504,27 +577,55 @@ def main(run_dir, data_dir, nb_epoch, early_stopping_patience, desired_sample_ra
         all_metrics = [skip_out_of_receptive_field(m) for m in all_metrics]
 
     model.compile(optimizer=optim, loss=loss, metrics=all_metrics)
+
+    plot_model(model, to_file='model.pdf', show_shapes=True)
+
     # TODO: Consider gradient weighting making last outputs more important.
+
+
+    # Save the model
+    checkpoint = ModelCheckpoint(filepath=os.path.join(checkpoint_dir, 'checkpoint.{epoch:05d}-{val_loss:.3f}.hdf5'),
+                                 monitor='val_loss',
+                                 verbose=1,
+                                 save_best_only=True,
+                                 save_weights_only=False,
+                                 mode='auto',
+                                 period=1)
 
     callbacks = [
         ReduceLROnPlateau(patience=early_stopping_patience / 2, cooldown=early_stopping_patience / 4, verbose=1),
         EarlyStopping(patience=early_stopping_patience, verbose=1),
     ]
+
     if not debug:
         callbacks.extend([
-            ModelCheckpoint(os.path.join(checkpoint_dir, 'checkpoint.{epoch:05d}-{val_loss:.3f}.hdf5'),
-                            save_best_only=True),
+            checkpoint,
+            # TerminateOnNaN,
             CSVLogger(os.path.join(run_dir, 'history.csv')),
         ])
+        if K.backend() == "tensorflow":
+            # tensorboard = TensorBoardWrapper(data_generators['test'], 8,  log_dir='./logs/' + datetime.datetime.now().strftime('run_%Y-%m-%d_%H-%M-%S'),
+            #                           histogram_freq=1,
+            #                           write_grads=True,
+            #                           write_graph=False,
+            #                           write_images=True)
+            tensorboard = TensorBoard(log_dir='./logs/' + datetime.datetime.now().strftime('run_%Y-%m-%d_%H-%M-%S'),
+                                      histogram_freq=0,
+                                      write_grads=True,
+                                      write_graph=False,
+                                      write_images=True)
+            callbacks.extend([
+                tensorboard
+            ])
 
     if not debug:
         os.mkdir(checkpoint_dir)
         _log.info('Starting Training...')
 
     model.fit_generator(data_generators['train'],
-                        nb_examples['train'],
-                        nb_epoch=nb_epoch,
+                        nb_examples['train'] / batch_size,
+                        epochs=nb_epoch,
                         validation_data=data_generators['test'],
-                        nb_val_samples=nb_examples['test'],
+                        validation_steps=nb_examples['test'] / batch_size,
                         callbacks=callbacks,
                         verbose=keras_verbose)
