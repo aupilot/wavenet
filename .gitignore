@@ -4,3 +4,5 @@
 models
 vctk/VCTK-Corpus
 logs
+model.pdf
+tmp.mat
